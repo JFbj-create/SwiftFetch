@@ -342,9 +342,8 @@ SwiftFetch/
 
 ## 七、已知限制
 
-1. BT 目前不支持 uTP / WebSeed / BEP-33 Scrape (UDP tracker 支持待完善)
-2. 插件热加载：目前需启动时通过 `--plugin-arg` 指定，运行时动态 Loader 在开发中
-3. 跨协议 HTTP+BT 混合协同的 piece 对齐校验 (HTTP Byte Range ↔ BT Piece Boundary) 仅在 `file_size % piece_length == 0` 时最优
+1. 插件热加载：目前需启动时通过 `--plugin-arg` 指定，运行时动态 Loader 在开发中
+2. 跨协议 HTTP+BT 混合协同的 piece 对齐校验 (HTTP Byte Range ↔ BT Piece Boundary) 仅在 `file_size % piece_length == 0` 时最优
 
 ---
 
