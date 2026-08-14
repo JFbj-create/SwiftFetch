@@ -19,7 +19,7 @@
 | 7 | **WebDAV / WebDAVS** | `dav://user:pass@nas/backup.tar.zst`<br>`davs://nextcloud.user/remote.php/dav/files/u/` | `webdav` | ✅ HTTP Range | ✅ 多连接 (复用HTTP) | ✅ ETag (服务器实现相关) | ❌ DAV 明文<br>✅ DAVS TLS | [reqwest_dav](https://crates.io/crates/reqwest_dav) PROPFIND + reqwest GET | ✅ 可用 |
 | 8 | **rsync (增量同步)** | `rsync+ssh://user@server:/data/huge.tar.zst`<br>`rsync://mirror.centos.org/centos/` | `rsync` | ➖ 算法级 delta (不能任意 Range) | ➖ 不切分 (整文件对比) | ✅ xxHash3 强校验 | ✅ SSH 通道 (rsync+ssh://)<br>⚠️ rsync:// 明文 | [libsync3](https://github.com/Bechma/libsync3) 纯 Rust xxhash3 rsync 算法<br>+ SSH 管道执行远端 `rsync --sender` | 🏗️ 骨架已写 |
 | 9 | **IPFS / IPNS** | `ipfs://bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi`<br>`ipns://en.wikipedia-on-ipfs.org` | `ipfs` | ➖ CID 不可变 (支持全量+Gateway Range) | ✅ Bitswap 多 Peer | ✅ CID 内联 Multihash | ✅ Kubo RPC (localhost)<br>✅ HTTPS Gateway | 双通道：<br>• [Kubo](https://github.com/ipfs/kubo) HTTP RPC `http://127.0.0.1:5001/api/v0` (需本地运行 ipfs daemon)<br>• Gateway `https://ipfs.io/ipfs/<CID>` (复用 HTTP 内核) | 🏗️ 骨架已写 |
-| 10 | **BitTorrent + Magnet** | `.torrent` 文件路径<br>`magnet:?xt=urn:btih:ADM4...` | `bittorrent` (默认) | ➖ Piece-level | ✅ 多 Peer 并发 | ✅ Each Piece SHA-1 | ➖ 明文 Peer Wire | 自研 `bt_engine.rs` wire protocol + DHT / PEX Peer 发现 | ✅ 生产就绪 |
+| 10 | **BitTorrent + Magnet** | `.torrent` 文件路径<br>`magnet:?xt=urn:btih:ADM4...` | `bittorrent` (默认) | ➖ Piece-level | ✅ 多 Peer 并发<br>✅ **uTP** UDP 低延迟传输<br>✅ **WebSeed** (BEP-19) HTTP 种子源 | ✅ Each Piece SHA-1 | ➖ 明文 Peer Wire<br>✅ **BEP-33 Scrape** Swarm 统计 | 自研 `bt_engine.rs` Wire Protocol + DHT/PEX Peer 发现 + **BEP-19 WebSeed / BEP-33 HTTP Tracker Scrape / uTP (UtpSocket)** | ✅ 生产就绪 |
 
 ### 🔐 协议能力位标志 (Capability Bitflags)
 

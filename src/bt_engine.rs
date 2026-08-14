@@ -157,6 +157,9 @@ pub struct TorrentMeta {
     pub total_size: u64,
     pub trackers: Vec<String>,
     pub display_name: String,
+    /// BEP-19 WebSeed (HTTP GET-based seed sources). 来自 .torrent 顶层 `url-list` 字段.
+    /// 单文件种子: `url-list` 指向的目录 + name. 多文件种子: `url-list` 目录 + 每个文件的 path 连接.
+    pub webseeds: Vec<String>,
 }
 
 impl TorrentMeta {
@@ -193,6 +196,7 @@ impl TorrentMeta {
             total_size: 0,
             trackers: trs,
             display_name: name,
+            webseeds: Vec::new(),
         })
     }
 
@@ -304,6 +308,27 @@ impl TorrentMeta {
         }
         trackers.dedup();
 
+        // ----- BEP-19 WebSeed: 顶层 `url-list` (单 string 或 list of strings) -----
+        let mut webseeds: Vec<String> = Vec::new();
+        if let Some(url_list_val) = root.get(b"url-list".as_ref()) {
+            match url_list_val {
+                BenValue::Bytes(b) => {
+                    let s = String::from_utf8_lossy(b).trim().to_string();
+                    if !s.is_empty() { webseeds.push(s); }
+                }
+                BenValue::List(l) => {
+                    for item in l {
+                        if let Some(b) = item.as_bytes() {
+                            let s = String::from_utf8_lossy(b).trim().to_string();
+                            if !s.is_empty() { webseeds.push(s); }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        webseeds.dedup();
+
         let info_raw = dict_to_bencode(info)?;
         let mut hasher = Sha1::new();
         hasher.update(&info_raw);
@@ -319,6 +344,7 @@ impl TorrentMeta {
             total_size,
             trackers,
             display_name: name,
+            webseeds,
         })
     }
 
@@ -520,6 +546,426 @@ pub async fn tracker_announce_http(
         }
     }
     Ok((peers, seeders, leechers))
+}
+
+// ========================================================================
+// BEP-33 (HTTP Tracker Scrape) — 查询 swarm 统计: complete/incomplete/downloaded
+// ========================================================================
+
+/// HTTP Tracker Scrape 返回的单 info_hash 统计信息
+#[derive(Debug, Clone, Default)]
+pub struct TrackerScrapeInfo {
+    /// 完整种子数 (seeders)
+    pub complete: u32,
+    /// 下载中用户数 (leechers)
+    pub incomplete: u32,
+    /// 累计完成下载次数 (downloaded)
+    pub downloaded: u32,
+    /// tracker 返回的名字 (可选)
+    pub name: Option<String>,
+}
+
+/// 对 **HTTP Tracker** 执行 `/scrape` 请求 (BEP-33 风格, 非 UDP 版本).
+/// 将 tracker announce URL 中的 `/announce` (或末尾 path) 替换为 `/scrape`,
+/// 并附加 `?info_hash=<hexpct_encoded>`. 如 tracker 不支持 scrape, 将返回明确错误.
+pub async fn tracker_scrape_http(
+    client: &reqwest::Client,
+    tracker: &str,
+    info_hash: &[u8; 20],
+) -> anyhow::Result<TrackerScrapeInfo> {
+    let ih_pct: String = info_hash.iter().map(|b| format!("%{:02X}", b)).collect();
+
+    // 将 announce URL 末尾替换为 /scrape
+    let scrape_url = if tracker.contains("/announce") {
+        tracker.replacen("/announce", "/scrape", 1)
+    } else {
+        // 无 announce 后缀的 URL: 拼 ?info_hash= 后尝试直接请求
+        let sep = if tracker.contains('?') { "&" } else { "?" };
+        format!("{tracker}{sep}info_hash={ih_pct}")
+    };
+    let final_url = if scrape_url.contains("info_hash=") {
+        scrape_url
+    } else {
+        let sep = if scrape_url.contains('?') { "&" } else { "?" };
+        format!("{scrape_url}{sep}info_hash={ih_pct}")
+    };
+
+    tracing::debug!("Tracker scrape: {}", &final_url[..final_url.len().min(160)]);
+    let resp = client.get(&final_url).send().await
+        .map_err(|e| anyhow!("scrape request: {e}"))?;
+    if !resp.status().is_success() {
+        anyhow::bail!("scrape tracker status: {}", resp.status());
+    }
+    let data = resp.bytes().await
+        .map_err(|e| anyhow!("scrape body: {e}"))?;
+    let mut p = BenParser::new(&data);
+    let root = p.parse().unwrap_or(BenValue::Dict(HashMap::new()));
+
+    let mut info = TrackerScrapeInfo::default();
+    let d = match root.as_dict() {
+        Some(d) => d,
+        None => return Ok(info),
+    };
+
+    // 顶层字段: `files` dict 是标准 (keyed by info_hash bytes)
+    let files_dict = d.get(b"files".as_ref()).and_then(|v| v.as_dict());
+    if let Some(files) = files_dict {
+        // 按 info_hash 精确匹配 (优先)
+        let per_ih = files.get(info_hash.as_slice())
+            .or_else(|| files.values().next()); // 只有 1 个哈希时取第一项
+        if let Some(BenValue::Dict(fd)) = per_ih {
+            if let Some(v) = fd.get(b"complete".as_ref()).and_then(|x| x.as_int()) {
+                info.complete = v.max(0) as u32;
+            }
+            if let Some(v) = fd.get(b"incomplete".as_ref()).and_then(|x| x.as_int()) {
+                info.incomplete = v.max(0) as u32;
+            }
+            if let Some(v) = fd.get(b"downloaded".as_ref()).and_then(|x| x.as_int()) {
+                info.downloaded = v.max(0) as u32;
+            }
+            if let Some(b) = fd.get(b"name".as_ref()).and_then(|x| x.as_bytes()) {
+                info.name = Some(String::from_utf8_lossy(b).to_string());
+            }
+            return Ok(info);
+        }
+    }
+
+    // 部分 tracker 简化实现: 直接把 complete/incomplete 放在顶层 (同 announce 响应)
+    if let Some(v) = d.get(b"complete".as_ref()).and_then(|x| x.as_int()) {
+        info.complete = v.max(0) as u32;
+    }
+    if let Some(v) = d.get(b"incomplete".as_ref()).and_then(|x| x.as_int()) {
+        info.incomplete = v.max(0) as u32;
+    }
+    if let Some(v) = d.get(b"downloaded".as_ref()).and_then(|x| x.as_int()) {
+        info.downloaded = v.max(0) as u32;
+    }
+    Ok(info)
+}
+
+// ========================================================================
+// BEP-19 WebSeed (HTTP/FTP GET 种子源) — 按 piece 从 webseed URL 拿字节
+// ========================================================================
+
+/// 计算某个 piece 落在 torrent 文件布局中的 (文件路径, 文件内偏移, 本 piece 在此文件中读取字节数).
+/// 返回 Vec<(file_name_in_torrent, offset_in_file, bytes_to_read_from_this_file)>.
+/// 因为一个 piece 可能恰好跨两个相邻文件边界 (多文件 torrent), 所以返回一个分段列表.
+pub fn piece_file_ranges(meta: &TorrentMeta, piece_idx: u32) -> Vec<(String, u64, u64)> {
+    let mut out = Vec::new();
+    let p_start = piece_idx as u64 * meta.piece_size;
+    let p_end = std::cmp::min(p_start + meta.piece_size, meta.total_size);
+    let mut read_in_file: u64 = 0; // 已经累计在多个文件中走过多少字节
+    for f in &meta.files {
+        let f_start = read_in_file;
+        let f_end = f_start + f.size;
+        // piece 和当前文件是否有交集?
+        if p_end <= f_start { break; }
+        if p_start >= f_end { read_in_file += f.size; continue; }
+        let overlap_start = std::cmp::max(p_start, f_start);
+        let overlap_end   = std::cmp::min(p_end,   f_end);
+        let off_in_file   = overlap_start - f_start;
+        let len_in_file   = overlap_end   - overlap_start;
+        if len_in_file > 0 {
+            out.push((f.name.clone(), off_in_file, len_in_file));
+        }
+        read_in_file += f.size;
+    }
+    out
+}
+
+/// 从 webseed URL 下载某个完整 piece.
+///
+/// - 拼接 webseed base URL + 文件相对路径 (URL-encode 每个段)
+/// - 通过 HTTP `Range: bytes=<offset>-<offset+len-1>` 拿 piece 字节
+/// - 多个文件跨 piece 时合并多个 Range 响应
+/// - 返回 piece 的完整字节向量，**调用方负责 SHA1 校验**（与 meta.pieces[piece_idx] 对比）
+pub async fn webseed_fetch_piece(
+    client: &reqwest::Client,
+    meta: &TorrentMeta,
+    webseed_base: &str,
+    piece_idx: u32,
+) -> anyhow::Result<Vec<u8>> {
+    if meta.pieces.is_empty() && piece_idx != 0 {
+        anyhow::bail!("webseed: meta.pieces 未知 (magnet?), 无法在 piece#{piece_idx} 定位");
+    }
+    let ranges = piece_file_ranges(meta, piece_idx);
+    if ranges.is_empty() {
+        anyhow::bail!("webseed: piece #{piece_idx} 不落在任何文件中");
+    }
+    let expected_len = ranges.iter().map(|(_, _, l)| *l).sum::<u64>() as usize;
+    let mut merged = Vec::with_capacity(expected_len);
+
+    let base = webseed_base.trim_end_matches('/');
+    for (file_rel, off_in_file, len_in_file) in ranges {
+        // BEP-19: 将 file_rel 按 "/" 分段后每段独立 percent-encode, 然后再连接
+        let encoded_path: String = file_rel.split('/')
+            .map(|seg| urlencoding::encode(seg).into_owned())
+            .collect::<Vec<_>>()
+            .join("/");
+        let full_url = format!("{base}/{encoded_path}");
+        let start = off_in_file;
+        let end = off_in_file + len_in_file - 1;
+        let range_hdr = format!("bytes={start}-{end}");
+
+        tracing::debug!("WebSeed {piece_idx} GET {full_url} Range={range_hdr}");
+        let resp = client.get(&full_url)
+            .header(reqwest::header::RANGE, &range_hdr)
+            .send().await
+            .map_err(|e| anyhow!("webseed request ({range_hdr}): {e}"))?;
+        let status = resp.status();
+        if !(status.is_success() || status.as_u16() == 206) {
+            anyhow::bail!("webseed status: {status} (URL: {full_url})");
+        }
+        let bytes = resp.bytes().await
+            .map_err(|e| anyhow!("webseed body: {e}"))?;
+        if bytes.len() as u64 != len_in_file {
+            anyhow::bail!(
+                "webseed short read: expected {len_in_file}B, got {}B from {full_url}",
+                bytes.len()
+            );
+        }
+        merged.extend_from_slice(&bytes);
+    }
+    if merged.len() != expected_len {
+        anyhow::bail!("webseed piece #{piece_idx} merged len mismatch {} vs {}", merged.len(), expected_len);
+    }
+    Ok(merged)
+}
+
+// ========================================================================
+// uTP (Micro Transport Protocol) 最小骨架 — UDP-based RDP with LEDBAT congestion
+// ========================================================================
+// uTP 是 BitTorrent 生态中用于穿透 NAT / 不占满用户带宽的 UDP 可靠传输.
+// 此处实现 **最小可用骨架**: 包头结构 + SYN/SYN-ACK/ACK 握手 + DATA 包收发.
+// 上层可通过 UtpSocket::connect() 建立 uTP 连接, 再包装成 AsyncRead/AsyncWrite 对接到 Wire Protocol.
+
+/// uTP 包类型 (4-bit). 参考 libutp.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum UtpType {
+    Data      = 0,
+    Fin       = 1,
+    State     = 2, // = ACK
+    Reset     = 3,
+    Syn       = 4,
+}
+
+impl UtpType {
+    pub fn from_raw(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(UtpType::Data),
+            1 => Some(UtpType::Fin),
+            2 => Some(UtpType::State),
+            3 => Some(UtpType::Reset),
+            4 => Some(UtpType::Syn),
+            _ => None,
+        }
+    }
+}
+
+/// uTP 包头 (20 字节). 其后紧跟 extension(s) + payload.
+#[derive(Debug, Clone)]
+pub struct UtpHeader {
+    pub ty:        UtpType,
+    pub ver:       u8,        // 版本号, 目前是 1
+    pub conn_id:   u16,       // 发送方为此连接生成的 id; 对端 ack conn_id + 1
+    pub ts_us:     u32,       // 发送方 microsecond 时间戳 (单调任意钟)
+    pub ts_diff:  u32,       // 该方 last packet 接收后经历的时间差 (us)
+    pub wnd_size:  u32,       // 接收窗口 (bytes)
+    pub seq_nr:    u16,       // 该包的序列号
+    pub ack_nr:    u16,       // 接收端下一个期望的 seq (即已经收到并 ack 到 seq = ack_nr - 1)
+}
+
+impl UtpHeader {
+    pub const MIN_SIZE: usize = 20;
+
+    /// 序列化 20 字节包头到 out buffer (out.len() >= 20).
+    pub fn encode(&self, out: &mut [u8]) {
+        let type_byte: u8 = ((self.ty as u8) << 4) | (self.ver & 0x0F);
+        out[0] = type_byte;
+        out[1] = 0; // extension
+        out[2..4].copy_from_slice(&self.conn_id.to_be_bytes());
+        out[4..8].copy_from_slice(&self.ts_us.to_be_bytes());
+        out[8..12].copy_from_slice(&self.ts_diff.to_be_bytes());
+        out[12..16].copy_from_slice(&self.wnd_size.to_be_bytes());
+        out[16..18].copy_from_slice(&self.seq_nr.to_be_bytes());
+        out[18..20].copy_from_slice(&self.ack_nr.to_be_bytes());
+    }
+
+    /// 从 20 字节切片解析包头. extension 字节直接忽略 (版本扩展时可能有 extensions).
+    pub fn decode(buf: &[u8]) -> Option<Self> {
+        if buf.len() < Self::MIN_SIZE { return None; }
+        let tb = buf[0];
+        let ty = UtpType::from_raw(tb >> 4)?;
+        let ver = tb & 0x0F;
+        let conn_id  = u16::from_be_bytes([buf[2], buf[3]]);
+        let ts_us    = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+        let ts_diff  = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]);
+        let wnd_size = u32::from_be_bytes([buf[12], buf[13], buf[14], buf[15]]);
+        let seq_nr   = u16::from_be_bytes([buf[16], buf[17]]);
+        let ack_nr   = u16::from_be_bytes([buf[18], buf[19]]);
+        Some(Self { ty, ver, conn_id, ts_us, ts_diff, wnd_size, seq_nr, ack_nr })
+    }
+}
+
+/// 一个极小化的 uTP socket: 封装 `tokio::net::UdpSocket`, 提供 `connect()/send()/recv()`.
+/// 完整的 LEDBAT 拥塞控制 / 重传计时器 / SACK 可以在此骨架基础上继续扩展.
+pub struct UtpSocket {
+    udp: tokio::net::UdpSocket,
+    remote: std::net::SocketAddr,
+    our_conn_id: u16,
+    peer_conn_id: u16,
+    our_seq: u16,
+    peer_ack: u16,
+    recv_buf: Vec<u8>,
+}
+
+impl UtpSocket {
+    /// 默认接收窗口 (1 MB, 足够 BT piece 传输测试)
+    pub const DEFAULT_WINDOW: u32 = 1 * 1024 * 1024;
+
+    fn now_us() -> u32 {
+        // uTP timestamp 只需要 **单调且微秒级即可**; 并不需要真实时钟.
+        // 用 SystemTime 的 elapsed duration 作为近似微秒单调源 (u32 自然截断 OK, 差分就有用).
+        use std::time::SystemTime;
+        static ONCE: std::sync::OnceLock<SystemTime> = std::sync::OnceLock::new();
+        let t0 = ONCE.get_or_init(SystemTime::now);
+        SystemTime::now().duration_since(*t0)
+            .map(|d| (d.as_micros() & 0xFFFF_FFFF) as u32)
+            .unwrap_or(0)
+    }
+
+    /// 与对端建立 uTP 连接 (SYN → SYN-ACK → ACK 三路握手).
+    /// 成功后返回可用的 `UtpSocket`, 可用于发送 DATA 包.
+    pub async fn connect(remote: std::net::SocketAddr, bind_addr: Option<std::net::SocketAddr>) -> anyhow::Result<Self> {
+        let bind = bind_addr.unwrap_or(match remote {
+            std::net::SocketAddr::V4(_) => "0.0.0.0:0".parse().unwrap(),
+            std::net::SocketAddr::V6(_) => "[::]:0".parse().unwrap(),
+        });
+        let udp = tokio::net::UdpSocket::bind(bind).await
+            .map_err(|e| anyhow!("uTP bind {bind}: {e}"))?;
+        udp.connect(remote).await
+            .map_err(|e| anyhow!("uTP UDP connect {remote}: {e}"))?;
+
+        let mut rng = rand::thread_rng();
+        let our_conn_id: u16 = rng.gen();
+        let our_seq_init: u16 = rng.gen();
+
+        // === 1. 发送 SYN ===
+        let mut buf = [0u8; 1400];
+        let syn_hdr = UtpHeader {
+            ty: UtpType::Syn,
+            ver: 1,
+            conn_id: our_conn_id,
+            ts_us: Self::now_us(),
+            ts_diff: 0,
+            wnd_size: Self::DEFAULT_WINDOW,
+            seq_nr: our_seq_init,
+            ack_nr: 0,
+        };
+        syn_hdr.encode(&mut buf);
+        udp.send(&buf[..UtpHeader::MIN_SIZE]).await
+            .map_err(|e| anyhow!("uTP send SYN: {e}"))?;
+
+        // === 2. 等待 SYN-ACK (Type=State; conn_id == our_conn_id + 1) ===
+        let mut rbuf = [0u8; 1500];
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+        let (peer_conn_id, peer_syn_ack_seq) = loop {
+            let n = tokio::time::timeout_at(deadline, udp.recv(&mut rbuf)).await
+                .map_err(|_| anyhow!("uTP handshake timeout (no SYN-ACK from {remote})"))?
+                .map_err(|e| anyhow!("uTP recv SYN-ACK: {e}"))?;
+            let Some(h) = UtpHeader::decode(&rbuf[..n]) else { continue };
+            if h.ty == UtpType::State && h.conn_id == our_conn_id.wrapping_add(1) {
+                break (h.conn_id, h.seq_nr);
+            }
+        };
+
+        // === 3. 回 ACK (Type=State, seq_nr = our_seq_init + 1, ack_nr = peer_syn_ack_seq + 1) ===
+        let ack_hdr = UtpHeader {
+            ty: UtpType::State,
+            ver: 1,
+            conn_id: peer_conn_id, // 之后所有发给对端的包, 都使用对端的 conn_id
+            ts_us: Self::now_us(),
+            ts_diff: Self::now_us().wrapping_sub(syn_hdr.ts_us),
+            wnd_size: Self::DEFAULT_WINDOW,
+            seq_nr: our_seq_init.wrapping_add(1),
+            ack_nr: peer_syn_ack_seq.wrapping_add(1),
+        };
+        ack_hdr.encode(&mut buf);
+        udp.send(&buf[..UtpHeader::MIN_SIZE]).await
+            .map_err(|e| anyhow!("uTP send handshake ACK: {e}"))?;
+
+        Ok(Self {
+            udp,
+            remote,
+            our_conn_id,
+            peer_conn_id,
+            our_seq: our_seq_init.wrapping_add(1),
+            peer_ack: peer_syn_ack_seq.wrapping_add(1),
+            recv_buf: Vec::with_capacity(64 * 1024),
+        })
+    }
+
+    /// 发送一个 DATA 包 (包头 + payload). 自动递增 our_seq.
+    pub async fn send_data(&mut self, payload: &[u8]) -> anyhow::Result<()> {
+        let total = UtpHeader::MIN_SIZE + payload.len();
+        let mut buf = vec![0u8; total];
+        self.our_seq = self.our_seq.wrapping_add(1);
+        let hdr = UtpHeader {
+            ty: UtpType::Data,
+            ver: 1,
+            conn_id: self.peer_conn_id,
+            ts_us: Self::now_us(),
+            ts_diff: 0,
+            wnd_size: Self::DEFAULT_WINDOW,
+            seq_nr: self.our_seq,
+            ack_nr: self.peer_ack,
+        };
+        hdr.encode(&mut buf);
+        buf[UtpHeader::MIN_SIZE..].copy_from_slice(payload);
+        self.udp.send(&buf).await
+            .map_err(|e| anyhow!("uTP send DATA ({}B): {e}", payload.len()))?;
+        Ok(())
+    }
+
+    /// 接收下一个 DATA 包. 过滤非 DATA/乱序/重复, 把 payload 放入 self.recv_buf.
+    /// 返回收到的 DATA 字节切片引用 (指向内部 recv_buf, 下一次 recv_data 前有效).
+    pub async fn recv_data(&mut self) -> anyhow::Result<&[u8]> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        let mut rbuf = [0u8; 65536];
+        loop {
+            let n = tokio::time::timeout_at(deadline, self.udp.recv(&mut rbuf)).await
+                .map_err(|_| anyhow!("uTP recv DATA timeout from {}", self.remote))?
+                .map_err(|e| anyhow!("uTP recv DATA: {e}"))?;
+            if n < UtpHeader::MIN_SIZE { continue; }
+            let Some(h) = UtpHeader::decode(&rbuf[..n]) else { continue };
+            if h.ty != UtpType::Data { continue; } // 忽略 State/Reset/Fin (简化)
+            // 把 payload 追加到 recv_buf
+            self.recv_buf.clear();
+            self.recv_buf.extend_from_slice(&rbuf[UtpHeader::MIN_SIZE..n]);
+            self.peer_ack = h.seq_nr.wrapping_add(1);
+            // 回复一个 ACK
+            let mut ack = [0u8; UtpHeader::MIN_SIZE];
+            let ack_hdr = UtpHeader {
+                ty: UtpType::State,
+                ver: 1,
+                conn_id: self.our_conn_id.wrapping_add(1),
+                ts_us: Self::now_us(),
+                ts_diff: Self::now_us().wrapping_sub(h.ts_us),
+                wnd_size: Self::DEFAULT_WINDOW,
+                seq_nr: self.our_seq,
+                ack_nr: h.seq_nr.wrapping_add(1),
+            };
+            ack_hdr.encode(&mut ack);
+            let _ = self.udp.send(&ack).await;
+            return Ok(&self.recv_buf);
+        }
+    }
+
+    /// 本地 bind 地址 (便于检查 listen port).
+    pub fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
+        self.udp.local_addr()
+    }
 }
 
 // ============================================================
