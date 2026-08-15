@@ -764,20 +764,53 @@ async fn run_with_progress_bar(
 
     let file_size = if let Some(p) = &probe { p.file_size }
         else {
+            // ---- CLI BT 路径: 预解析 meta (对齐 downloader_manager.rs 的修复逻辑) ----
+            // Hybrid模式下, HttpOnly 或 BtOnly 都会走这里读 meta 用 real total_size 创建 chunk_mgr
             let mut fs_from_bt = 0u64;
-            if let Some(tp) = &torrent {
-                if let Ok(data) = tokio::fs::read(tp).await {
-                    if let Ok(tm) = TorrentMeta::from_torrent_bytes(&data) {
-                        fs_from_bt = tm.total_size;
+            let rt = tokio::runtime::Handle::try_current();
+            if let Ok(handle) = rt {
+                // 已经在 tokio 上下文里: 直接 .await
+                let meta_res: anyhow::Result<TorrentMeta> =
+                    crate::bt_engine::pre_resolve_bt_meta(torrent.as_deref(), magnet.as_deref())
+                        .await;
+                if let Ok(tm) = &meta_res {
+                    fs_from_bt = tm.total_size;
+                }
+            } else {
+                // Fallback: 非 tokio 上下文则阻塞读 (罕见情况, 如纯 CLI 还没进入 runtime)
+                if let Some(tp) = &torrent {
+                    if let Ok(data) = std::fs::read(tp) {
+                        if let Ok(tm) = TorrentMeta::from_torrent_bytes(&data) {
+                            fs_from_bt = tm.total_size;
+                        }
                     }
                 }
             }
             fs_from_bt
         };
 
-    let base_chunk_size = cfg.calc_base_chunk_size_v3(file_size.max(1024 * 1024));
-    let actual_fs = file_size.max(1);
-    let mgr = Arc::new(HybridChunkManager::new(actual_fs, base_chunk_size));
+    // ---- 关键修复: 预解析 BT meta → 用真实 total_size + aligned_base 创建 chunk_mgr
+    // 对齐 downloader_manager.rs 中 #1~#4 的修复思路，避免 piece/base 错位
+    let (base_chunk_size, actual_fs, base_chunk_size_fs) = if protocol == ProtocolMode::BtOnly {
+        // 注意: run_with_progress_bar 是 async fn, 当前就在 tokio runtime 内 → 直接 .await
+        let meta_res: anyhow::Result<TorrentMeta> =
+            crate::bt_engine::pre_resolve_bt_meta(torrent.as_deref(), magnet.as_deref()).await;
+        if let Ok(tm) = meta_res {
+            let aligned = crate::bt_engine::calc_aligned_bt_base(&tm);
+            eprintln!("[BT] 预解析 OK: total_size={}MB pieces={} aligned_base={}KB",
+                tm.total_size / 1024 / 1024, tm.pieces.len(), aligned / 1024);
+            (aligned, tm.total_size, tm.total_size)
+        } else {
+            // 降级 (magnet 或解析失败): 用 file_size, 无则 1MB 假值
+            let fs = file_size.max(1024 * 1024);
+            (cfg.calc_base_chunk_size_v3(fs), file_size, fs)
+        }
+    } else {
+        // HTTP/Hybrid 用原来的逻辑
+        let fs = file_size.max(1024 * 1024);
+        (cfg.calc_base_chunk_size_v3(fs), file_size, fs)
+    };
+    let mgr = Arc::new(HybridChunkManager::new(base_chunk_size_fs, base_chunk_size));
 
     if let Some(parent) = output_path.parent() {
         std::fs::create_dir_all(parent).ok();

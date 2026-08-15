@@ -454,7 +454,9 @@ pub struct WebdavProvider {
 #[cfg(feature = "webdav")]
 impl WebdavProvider {
     pub fn new() -> Self {
-        Self { http_inner: Arc::new(HttpFamilyProvider::new_http2()) }
+        // 说明: HttpFamilyProvider 内部 reqwest 自动 ALPN 协商 HTTP/2 (tls)
+        //      不需要单独提供 new_http2 构造函数, 统一走 new_http1
+        Self { http_inner: Arc::new(HttpFamilyProvider::new_http1()) }
     }
 
     /// davs://host/path → https://host/path (WebDAV 底层就是 HTTP)
@@ -1055,7 +1057,9 @@ pub struct IpfsProvider {
 impl IpfsProvider {
     pub fn new() -> Self {
         Self {
-            http_inner: Arc::new(HttpFamilyProvider::new_http2()),
+            // 说明: HttpFamilyProvider 内部 reqwest 自动 ALPN 协商 HTTP/2,
+            //      统一走 new_http1()
+            http_inner: Arc::new(HttpFamilyProvider::new_http1()),
             kubo_rpc_base: "http://127.0.0.1:5001/api/v0".into(),
         }
     }

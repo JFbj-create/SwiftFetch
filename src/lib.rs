@@ -94,6 +94,8 @@ pub use bt_engine::{
     generate_peer_id,
     tracker_announce_http,
     peer_connect,
+    pre_resolve_bt_meta,
+    calc_aligned_bt_base,
 };
 
 pub use plugin::{

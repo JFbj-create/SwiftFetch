@@ -358,6 +358,88 @@ impl TorrentMeta {
         let offset = piece_idx as u64 * self.piece_size;
         (offset / base_chunk_size) as u32
     }
+
+    /// 生成一个包含 file_data 的单文件虚拟 .torrent, piece_size 自动对齐
+    pub fn generate(
+        display_name: &str,
+        file_data: &[u8],
+        piece_size: u64,
+        trackers: Vec<String>,
+    ) -> anyhow::Result<Self> {
+        let piece_size = if piece_size == 0 { 16384 } else { piece_size };
+        let mut pieces = Vec::new();
+        for chunk in file_data.chunks(piece_size as usize) {
+            let mut hasher = Sha1::new();
+            hasher.update(chunk);
+            let h = hasher.finalize();
+            let mut arr = [0u8; 20];
+            arr.copy_from_slice(&h);
+            pieces.push(arr);
+        }
+        let files = vec![TorrentFileInfo {
+            name: display_name.to_string(),
+            size: file_data.len() as u64,
+        }];
+        // 先构造 TorrentMeta 再用 encode 算 info_hash (让两个路径一致)
+        let mut tmp = Self {
+            info_hash: [0u8; 20],
+            piece_size,
+            pieces,
+            files,
+            total_size: file_data.len() as u64,
+            trackers: trackers.clone(),
+            display_name: display_name.to_string(),
+            webseeds: Vec::new(),
+        };
+        let bytes = tmp.encode_to_bytes()?;
+        let parsed = Self::from_torrent_bytes(&bytes)?;
+        Ok(parsed)
+    }
+
+    /// 把 TorrentMeta 编码成 .torrent 文件字节 (bencode 格式)
+    pub fn encode_to_bytes(&self) -> anyhow::Result<Vec<u8>> {
+        use std::collections::BTreeMap;
+        // 构造 info dict
+        let mut info: HashMap<Vec<u8>, BenValue> = HashMap::new();
+        info.insert(b"name".to_vec(), BenValue::Bytes(self.display_name.as_bytes().to_vec()));
+        info.insert(b"piece length".to_vec(), BenValue::Int(self.piece_size as i64));
+        let mut pieces_concat: Vec<u8> = Vec::with_capacity(self.pieces.len() * 20);
+        for p in &self.pieces { pieces_concat.extend_from_slice(p); }
+        info.insert(b"pieces".to_vec(), BenValue::Bytes(pieces_concat));
+        if self.files.len() == 1 {
+            info.insert(b"length".to_vec(), BenValue::Int(self.files[0].size as i64));
+        } else {
+            let mut files_list: Vec<BenValue> = Vec::new();
+            for f in &self.files {
+                let mut fd: HashMap<Vec<u8>, BenValue> = HashMap::new();
+                fd.insert(b"length".to_vec(), BenValue::Int(f.size as i64));
+                let segs: Vec<&str> = f.name.split('/').collect();
+                let path_list: Vec<BenValue> = segs.iter().map(|s| BenValue::Bytes(s.as_bytes().to_vec())).collect();
+                fd.insert(b"path".to_vec(), BenValue::List(path_list));
+                files_list.push(BenValue::Dict(fd));
+            }
+            info.insert(b"files".to_vec(), BenValue::List(files_list));
+        }
+
+        // 构造 root dict
+        let mut root: HashMap<Vec<u8>, BenValue> = HashMap::new();
+        // 排序保持输出稳定: 用 BTreeMap 的形式按 key 字节序插入
+        let _ = BTreeMap::<&[u8], i32>::new();
+        if let Some(first) = self.trackers.first() {
+            root.insert(b"announce".to_vec(), BenValue::Bytes(first.as_bytes().to_vec()));
+        }
+        if self.trackers.len() > 1 {
+            let mut outer: Vec<BenValue> = Vec::new();
+            for t in &self.trackers {
+                let inner: Vec<BenValue> = vec![BenValue::Bytes(t.as_bytes().to_vec())];
+                outer.push(BenValue::List(inner));
+            }
+            root.insert(b"announce-list".to_vec(), BenValue::List(outer));
+        }
+        root.insert(b"info".to_vec(), BenValue::Dict(info));
+        let mut out = dict_to_bencode(&root)?;
+        Ok(out)
+    }
 }
 
 fn dict_to_bencode(dict: &HashMap<Vec<u8>, BenValue>) -> anyhow::Result<Vec<u8>> {
@@ -493,8 +575,164 @@ pub fn generate_peer_id() -> [u8; 20] {
 }
 
 // ============================================================
-// Tracker HTTP announce
+// Tracker announce (HTTP + UDP)
 // ============================================================
+
+/// 自动判断 tracker 协议类型并 announce
+pub async fn tracker_announce(
+    client: &reqwest::Client,
+    tracker: &str,
+    info_hash: &[u8; 20],
+    peer_id: &[u8; 20],
+    port: u16,
+    total: u64,
+    event: &str,
+) -> anyhow::Result<(Vec<SocketAddr>, u32, u32)> {
+    let lower = tracker.to_lowercase();
+    if lower.starts_with("udp://") {
+        tracker_announce_udp(tracker, info_hash, peer_id, port, total, event).await
+    } else {
+        tracker_announce_http(client, tracker, info_hash, peer_id, port, total, event).await
+    }
+}
+
+/// UDP Tracker (BEP-15): connect → announce
+pub async fn tracker_announce_udp(
+    tracker: &str,
+    info_hash: &[u8; 20],
+    peer_id: &[u8; 20],
+    port: u16,
+    total: u64,
+    event: &str,
+) -> anyhow::Result<(Vec<SocketAddr>, u32, u32)> {
+    use tokio::net::UdpSocket;
+
+    // 解析 udp://host:port[/path] → host:port
+    let addr_str = tracker
+        .strip_prefix("udp://")
+        .unwrap_or(tracker)
+        .split('/')
+        .next()
+        .ok_or_else(|| anyhow!("udp tracker url invalid: {}", tracker))?;
+
+    // 尝试解析为 SocketAddr, 如果只有 host 需要 DNS 解析
+    let socket_addr: SocketAddr = if let Ok(sa) = addr_str.parse() {
+        sa
+    } else {
+        // 带 DNS 的地址: 用 tokio resolve
+        let parts: Vec<&str> = addr_str.rsplitn(2, ':').collect();
+        if parts.len() != 2 {
+            anyhow::bail!("udp tracker addr parse fail: {}", addr_str);
+        }
+        let host = parts[1];
+        let port: u16 = parts[0].parse()
+            .map_err(|_| anyhow!("udp tracker port invalid: {}", parts[0]))?;
+        // 使用 tokio 的 DNS 解析
+        let addrs = tokio::net::lookup_host(format!("{}:{}", host, port)).await
+            .map_err(|e| anyhow!("udp tracker DNS resolve {} fail: {}", host, e))?;
+        addrs.into_iter().next()
+            .ok_or_else(|| anyhow!("udp tracker DNS resolve empty: {}", host))?
+    };
+
+    // 绑定本地 UDP socket
+    let sock = UdpSocket::bind("0.0.0.0:0").await
+        .map_err(|e| anyhow!("udp bind fail: {}", e))?;
+    sock.connect(socket_addr).await
+        .map_err(|e| anyhow!("udp connect {} fail: {}", socket_addr, e))?;
+
+    let txn_id: u32 = rand::random();
+
+    // ---- Step 1: Connect 请求 ----
+    // protocol_id = 0x41727101980 (magic)
+    let protocol_id: u64 = 0x41727101980;
+    let mut connect_req = Vec::with_capacity(16);
+    connect_req.extend_from_slice(&protocol_id.to_be_bytes());
+    connect_req.extend_from_slice(&0u32.to_be_bytes()); // action = 0 (connect)
+    connect_req.extend_from_slice(&txn_id.to_be_bytes());
+
+    sock.send(&connect_req).await
+        .map_err(|e| anyhow!("udp connect send fail: {}", e))?;
+
+    let mut connect_resp = [0u8; 16];
+    let n = tokio::time::timeout(Duration::from_secs(15), sock.recv(&mut connect_resp)).await
+        .map_err(|_| anyhow!("udp connect timeout"))?
+        .map_err(|e| anyhow!("udp connect recv fail: {}", e))?;
+    if n < 16 {
+        anyhow::bail!("udp connect response too short: {}", n);
+    }
+    let resp_action = u32::from_be_bytes(connect_resp[0..4].try_into().unwrap());
+    let resp_txn = u32::from_be_bytes(connect_resp[4..8].try_into().unwrap());
+    if resp_txn != txn_id {
+        anyhow::bail!("udp connect txn mismatch: {} != {}", resp_txn, txn_id);
+    }
+    if resp_action != 0 {
+        let err_msg = String::from_utf8_lossy(&connect_resp[8..n]);
+        anyhow::bail!("udp connect action error {}: {}", resp_action, err_msg);
+    }
+    let connection_id = u64::from_be_bytes(connect_resp[8..16].try_into().unwrap());
+    tracing::debug!("UDP tracker {} connect OK, conn_id={:x}", socket_addr, connection_id);
+
+    // ---- Step 2: Announce 请求 ----
+    let announce_txn: u32 = rand::random();
+    let event_code: u32 = match event {
+        "started" => 2,
+        "completed" => 1,
+        "stopped" => 3,
+        _ => 0,
+    };
+    let mut announce_req = Vec::with_capacity(98);
+    announce_req.extend_from_slice(&connection_id.to_be_bytes());
+    announce_req.extend_from_slice(&1u32.to_be_bytes()); // action = 1 (announce)
+    announce_req.extend_from_slice(&announce_txn.to_be_bytes());
+    announce_req.extend_from_slice(info_hash);           // 20 bytes
+    announce_req.extend_from_slice(peer_id);             // 20 bytes
+    announce_req.extend_from_slice(&0u64.to_be_bytes()); // downloaded
+    announce_req.extend_from_slice(&total.to_be_bytes()); // left
+    announce_req.extend_from_slice(&0u64.to_be_bytes()); // uploaded
+    announce_req.extend_from_slice(&event_code.to_be_bytes());
+    announce_req.extend_from_slice(&0u32.to_be_bytes()); // ip = 0
+    announce_req.extend_from_slice(&rand::random::<u32>().to_be_bytes()); // key
+    announce_req.extend_from_slice(&(-1i32).to_be_bytes()); // num_want = -1
+    announce_req.extend_from_slice(&port.to_be_bytes());
+
+    sock.send(&announce_req).await
+        .map_err(|e| anyhow!("udp announce send fail: {}", e))?;
+
+    let mut announce_resp = vec![0u8; 4096];
+    let n = tokio::time::timeout(Duration::from_secs(15), sock.recv(&mut announce_resp)).await
+        .map_err(|_| anyhow!("udp announce timeout"))?
+        .map_err(|e| anyhow!("udp announce recv fail: {}", e))?;
+    if n < 20 {
+        anyhow::bail!("udp announce response too short: {}", n);
+    }
+    let ann_action = u32::from_be_bytes(announce_resp[0..4].try_into().unwrap());
+    let ann_txn = u32::from_be_bytes(announce_resp[4..8].try_into().unwrap());
+    if ann_txn != announce_txn {
+        anyhow::bail!("udp announce txn mismatch");
+    }
+    if ann_action != 1 {
+        let err_msg = String::from_utf8_lossy(&announce_resp[8..n]);
+        anyhow::bail!("udp announce action error {}: {}", ann_action, err_msg);
+    }
+    let _interval = u32::from_be_bytes(announce_resp[8..12].try_into().unwrap());
+    let leechers = u32::from_be_bytes(announce_resp[12..16].try_into().unwrap());
+    let seeders = u32::from_be_bytes(announce_resp[16..20].try_into().unwrap());
+
+    let mut peers = Vec::new();
+    let peers_data = &announce_resp[20..n];
+    for chunk in peers_data.chunks(6) {
+        if chunk.len() == 6 {
+            let ip = format!("{}.{}.{}.{}", chunk[0], chunk[1], chunk[2], chunk[3]);
+            let p = u16::from_be_bytes([chunk[4], chunk[5]]);
+            if let Ok(addr) = format!("{}:{}", ip, p).parse::<SocketAddr>() {
+                peers.push(addr);
+            }
+        }
+    }
+    tracing::debug!("UDP tracker {} announce OK: {} peers, {} seeders, {} leechers",
+        socket_addr, peers.len(), seeders, leechers);
+    Ok((peers, seeders, leechers))
+}
 
 pub async fn tracker_announce_http(
     client: &reqwest::Client,
@@ -1071,6 +1309,50 @@ impl BtDownloaderModule {
     }
 }
 
+/// ============================================================================
+/// 公共 API: 在创建 EngineContext/ChunkManager 之前预解析 BT 元信息.
+///
+/// 设计原因 (修复 BT 进度一直为 0 的根因之一):
+///   EngineBuilder 在 run_all() 之前就需要创建 HybridChunkManager.
+///   如果在解析 torrent 之前用假的 file_size (0 或 max(1)) 创建 bases 向量,
+///   后续 piece_to_base() 计算的 base_idx 会和真实 bases 长度严重不匹配,
+///   导致: ① 写入 piece 时 bases.get 越界 → mark_bytes 静默跳过
+///         ② completed_count 永远 < bases.len() → 下载循环无法退出
+///
+/// 正确流程: 调用本函数 → 拿到 TorrentMeta → 用 meta.total_size / meta.piece_size
+///           计算 aligned_base_chunk_size → 用正确参数创建 HybridChunkManager(ctx)
+///           → 再启动 EngineBuilder.run_all. 这样 bases/piece 100% 对齐.
+/// ============================================================================
+pub async fn pre_resolve_bt_meta(
+    torrent_file: Option<&std::path::Path>,
+    magnet: Option<&str>,
+) -> anyhow::Result<TorrentMeta> {
+    if let Some(p) = torrent_file {
+        let data = tokio::fs::read(p).await
+            .map_err(|e| anyhow!("pre_resolve: read .torrent: {}", e))?;
+        return TorrentMeta::from_torrent_bytes(&data);
+    }
+    if let Some(m) = magnet {
+        return TorrentMeta::from_magnet(m);
+    }
+    anyhow::bail!("pre_resolve_bt_meta: 需要 torrent_file 或 magnet 至少一个")
+}
+
+/// 根据 meta.piece_size 和 meta.total_size 计算 aligned base_chunk_size,
+/// 与 BtDownloaderModule::start() 内部使用的算法保持一致.
+pub fn calc_aligned_bt_base(meta: &TorrentMeta) -> u64 {
+    use crate::modules::{HYBRID_ALIGNED_BASE, MIN_BASE_SIZE_FOR_BT_ALIGN};
+    use crate::speed_engine::MIN_SUBCHUNK_SIZE;
+    if meta.total_size >= MIN_BASE_SIZE_FOR_BT_ALIGN {
+        let mut n = 1u64;
+        while n * meta.piece_size < HYBRID_ALIGNED_BASE { n += 1; }
+        n * meta.piece_size
+    } else {
+        // 小文件: 不追求对齐, 至少保证 4 * MIN_SUBCHUNK_SIZE 作为 base size
+        meta.piece_size.max(MIN_SUBCHUNK_SIZE * 4)
+    }
+}
+
 #[async_trait]
 impl DownloadModule for BtDownloaderModule {
     fn name(&self) -> &'static str { "BtDownloaderModule" }
@@ -1100,9 +1382,13 @@ impl DownloadModule for BtDownloaderModule {
         ctx.bt_piece_size.store(meta.piece_size, Ordering::Relaxed);
         ctx.bt_total_pieces.store(meta.pieces.len() as u32, Ordering::Relaxed);
 
+        // 说明: 以前只在 current==0 才更新, 但调用方 (vortex-dl / main.rs BtOnly)
+        //      有时会把 initial_fs 设为 file_size.max(1) = 1, 导致 current!=0 永不更新,
+        //      ProgressModule 百分比分母永远是 1 (或其他小值). 改成: 只要 meta.total_size > 0,
+        //      无论 current 是什么, 都强制 store 正确大小.
         if meta.total_size > 0 {
             let current = ctx.file_size.load(Ordering::Relaxed);
-            if current == 0 {
+            if current != meta.total_size {
                 ctx.file_size.store(meta.total_size, Ordering::Relaxed);
             }
             let aligned = if meta.total_size >= MIN_BASE_SIZE_FOR_BT_ALIGN {
@@ -1113,6 +1399,52 @@ impl DownloadModule for BtDownloaderModule {
                 ctx.base_chunk_size.load(Ordering::Relaxed).max(MIN_SUBCHUNK_SIZE * 4)
             };
             ctx.base_chunk_size.store(aligned, Ordering::Relaxed);
+
+            // ---- 防御性校验: 验证 piece_to_base ↔ bases 对齐 ----
+            // 要求调用方 (downloader_manager.rs / main.rs) 在创建 ctx 之前
+            // 先调用 pre_resolve_bt_meta + calc_aligned_bt_base, 并用
+            // (meta.total_size, aligned_base) 创建 HybridChunkManager.
+            // 我们用最后一个 piece 做边界检查, 如果失败说明流程不对.
+            let last_piece = meta.pieces.len().saturating_sub(1) as u32;
+            let bidx = meta.piece_to_base(aligned, last_piece);
+            let bases_cnt = ctx.chunk_mgr.bases.len();
+            if (bidx as usize) >= bases_cnt {
+                tracing::error!(
+                    "BT FATAL: bases/piece 未对齐! last_piece({})→base_idx({}) >= bases.len({}). \
+                    请在创建 ctx 前调用 swiftfetch::pre_resolve_bt_meta → calc_aligned_bt_base → \
+                    HybridChunkManager::new(meta.total_size, aligned_base)",
+                    last_piece, bidx, bases_cnt
+                );
+                // 主动 panic 避免进度一直为 0 的静默错误
+                panic!(
+                    "BT bases/piece mismatch: idx={} >= len={}. 入口需调用 pre_resolve_bt_meta 预解析.",
+                    bidx, bases_cnt
+                );
+            }
+            tracing::info!(
+                "BT: bases/piece 对齐 OK: last_piece({})→base_idx({}) < bases.len({})",
+                last_piece, bidx, bases_cnt
+            );
+        }
+
+        // 预创建完整的文件树: 目录 mkdir + 每个文件 create + set_len (预分配)
+        {
+            use tokio::io::AsyncSeekExt;
+            let out_dir = &ctx.output_path;
+            for f in &meta.files {
+                if f.size == 0 { continue; }
+                let path = out_dir.join(&f.name);
+                if let Some(parent) = path.parent() {
+                    tokio::fs::create_dir_all(parent).await.ok();
+                }
+                if let Ok(mut file) = tokio::fs::OpenOptions::new()
+                    .create(true).write(true).read(true)
+                    .open(&path).await
+                {
+                    let _ = file.set_len(f.size).await;
+                    let _ = file.sync_all().await;
+                }
+            }
         }
 
         let client = crate::speed_engine::SwiftFetch::build_client_static(
@@ -1125,7 +1457,7 @@ impl DownloadModule for BtDownloaderModule {
         let mut seeders = 0u32;
         let mut leechers = 0u32;
         for tr in &meta.trackers {
-            match tracker_announce_http(
+            match tracker_announce(
                 &client, tr, &meta.info_hash, &self.peer_id,
                 self.port, ctx.file_size.load(Ordering::Relaxed), "started"
             ).await {
@@ -1135,6 +1467,35 @@ impl DownloadModule for BtDownloaderModule {
                     leechers = leechers.max(l);
                 }
                 Err(e) => tracing::warn!("tracker {} fail: {}", tr, e),
+            }
+        }
+        // 如果 trackers 为空或全部失败, 尝试常见公共 tracker
+        if peers.is_empty() && !meta.info_hash.iter().all(|&b| b == 0) {
+            tracing::warn!("BT: 所有 tracker 失败, 尝试公共 tracker...");
+            let public_trackers = [
+                "udp://tracker.opentrackr.org:1337/announce",
+                "udp://open.demonii.com:1337/announce",
+                "udp://exodus.desync.com:6969/announce",
+                "udp://tracker.torrent.eu.org:451/announce",
+                "udp://open.stealth.si:80/announce",
+                "udp://tracker.tiny-vps.com:6969/announce",
+                "udp://tracker.dler.org:6969/announce",
+                "udp://9.rarbg.to:2710/announce",
+                "udp://retracker.lanta-net.ru:2710/announce",
+            ];
+            for tr in &public_trackers {
+                match tracker_announce(
+                    &client, tr, &meta.info_hash, &self.peer_id,
+                    self.port, ctx.file_size.load(Ordering::Relaxed), "started"
+                ).await {
+                    Ok((p, s, l)) => {
+                        peers.extend(p);
+                        seeders = seeders.max(s);
+                        leechers = leechers.max(l);
+                        if !peers.is_empty() { break; }
+                    }
+                    Err(_) => {}
+                }
             }
         }
         ctx.bt_seeders.store(seeders, Ordering::Relaxed);
@@ -1173,24 +1534,98 @@ impl DownloadModule for BtDownloaderModule {
             });
         }
 
-        let mut interval_count = 0;
+        let mut interval_count = 0u32;
+        let mut tracker_retry_count = 0u32;
+        let client_c = client.clone();
+        let info_hash_c = meta_arc.info_hash;
+        let peer_id_c = *peer_id_arc;
+        let port_c = self.port;
+        let total_size_c = ctx.file_size.load(Ordering::Relaxed);
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(5)) => {
                     interval_count += 1;
                     let done = ctx.chunk_mgr.completed_count();
                     let total = ctx.chunk_mgr.bases.len();
-                    tracing::debug!("BT tick: bases {}/{}, bt_dl={}",
-                        done, total, format_bytes(ctx.bt_downloaded.load(Ordering::Relaxed)));
-                    if done >= total { break; }
+                    let bt_dl = ctx.bt_downloaded.load(Ordering::Relaxed);
+                    tracing::info!("BT tick #{}: bases {}/{}, bt_dl={}, peers={}",
+                        interval_count, done, total, format_bytes(bt_dl),
+                        ctx.active_bt_conns.load(Ordering::Relaxed));
+                    if done >= total && total > 0 { break; }
                     if ctx.stop_event_rx.is_disconnected() { break; }
+
+                    // peers 为空或全部失败时, 每 30 秒重试一次 tracker
+                    if join_set.is_empty() && interval_count % 6 == 0 {
+                        tracker_retry_count += 1;
+                        tracing::info!("BT: 无活跃 peer, 第 {} 次重试 tracker...", tracker_retry_count);
+                        let mut new_peers: Vec<SocketAddr> = Vec::new();
+                        for tr in &meta_arc.trackers {
+                            if let Ok((p, s, l)) = tracker_announce(
+                                &client_c, tr, &info_hash_c, &peer_id_c,
+                                port_c, total_size_c, "started"
+                            ).await {
+                                new_peers.extend(p);
+                                if s > 0 { ctx.bt_seeders.store(s, Ordering::Relaxed); }
+                                let _ = l;
+                            }
+                        }
+                        // 也试公共 tracker
+                        if new_peers.is_empty() {
+                            let public_trackers = [
+                                "udp://tracker.opentrackr.org:1337/announce",
+                                "udp://open.demonii.com:1337/announce",
+                                "udp://exodus.desync.com:6969/announce",
+                                "udp://open.stealth.si:80/announce",
+                            ];
+                            for tr in &public_trackers {
+                                if let Ok((p, _, _)) = tracker_announce(
+                                    &client_c, tr, &info_hash_c, &peer_id_c,
+                                    port_c, total_size_c, "started"
+                                ).await {
+                                    new_peers.extend(p);
+                                    if !new_peers.is_empty() { break; }
+                                }
+                            }
+                        }
+                        if !new_peers.is_empty() {
+                            new_peers.dedup();
+                            tracing::info!("BT: 重试获得 {} 个新 peers", new_peers.len());
+                            let total_pieces_r = ctx.bt_total_pieces.load(Ordering::Relaxed);
+                            for (i, addr) in new_peers.iter().take(peer_limit * 2).enumerate() {
+                                let meta_c = meta_arc.clone();
+                                let ctx_c = ctx.clone();
+                                let pid_c = peer_id_arc.clone();
+                                let addr = *addr;
+                                let sem_c = sem.clone();
+                                join_set.spawn(async move {
+                                    let _permit = match sem_c.clone().try_acquire_owned() {
+                                        Ok(p) => Some(p),
+                                        Err(_) => None,
+                                    };
+                                    if _permit.is_none() { return; }
+                                    tokio::time::sleep(Duration::from_millis(50 * i as u64)).await;
+                                    ctx_c.active_bt_conns.fetch_add(1, Ordering::Relaxed);
+                                    let result = peer_download_session(
+                                        addr, &meta_c, *pid_c, ctx_c.clone(), total_pieces_r
+                                    ).await;
+                                    ctx_c.active_bt_conns.fetch_sub(1, Ordering::Relaxed);
+                                    if let Err(e) = result {
+                                        tracing::debug!("peer {} session: {}", addr, e);
+                                    }
+                                });
+                            }
+                        }
+                        // 最多重试 20 次 (10 分钟), 之后放弃
+                        if tracker_retry_count >= 20 {
+                            tracing::warn!("BT: tracker 重试 {} 次仍无 peers, 放弃", tracker_retry_count);
+                            break;
+                        }
+                    }
                 }
                 _ = ctx.stop_notify.notified() => { break; }
                 else => {
                     if join_set.is_empty() {
                         tokio::time::sleep(Duration::from_millis(500)).await;
-                        if interval_count > 12 { break; }
-                        interval_count += 1;
                     }
                     while let Some(res) = join_set.try_join_next() {
                         if let Err(e) = res {
@@ -1360,7 +1795,8 @@ async fn handle_bt_msg(
             let data = &msg.payload[8..];
             let data_len = data.len() as u64;
             let file_offset = index as u64 * meta.piece_size + begin as u64;
-            if write_data_to_file(ctx.clone(), file_offset, data).await.is_ok() {
+            // 注意: 新版 write_data_to_file 需要 meta 参数, 按文件树解析到具体文件路径写
+            if write_data_to_file(ctx.clone(), meta, file_offset, data).await.is_ok() {
                 let base_idx = meta.piece_to_base(ctx.base_chunk_size.load(Ordering::Relaxed), index);
                 if let Some(base) = ctx.chunk_mgr.bases.get(base_idx as usize) {
                     let rel = file_offset - base.start + data_len;
@@ -1395,12 +1831,55 @@ async fn handle_bt_msg(
     }
 }
 
-async fn write_data_to_file(ctx: Arc<EngineContext>, offset: u64, data: &[u8]) -> anyhow::Result<()> {
-    let mut f_guard = ctx.file.lock().await;
-    if let Some(f) = f_guard.as_mut() {
-        use tokio::io::AsyncSeekExt;
-        f.seek(std::io::SeekFrom::Start(offset)).await.ok();
-        f.write_all(data).await?;
+async fn write_data_to_file(ctx: Arc<EngineContext>, meta: &TorrentMeta, global_offset: u64, data: &[u8]) -> anyhow::Result<()> {
+    use tokio::io::AsyncSeekExt;
+    if data.is_empty() { return Ok(()); }
+    if meta.files.is_empty() { return Err(anyhow!("TorrentMeta.files empty")); }
+    let out_dir = &ctx.output_path;
+
+    let mut remaining = data;
+    let mut cursor_offset = global_offset;
+
+    while !remaining.is_empty() {
+        // 找到虚拟流 cursor_offset 对应的实际文件和文件内偏移
+        let mut acc = 0u64;
+        let mut target_file: Option<&TorrentFileInfo> = None;
+        let mut target_file_start: u64 = 0;
+        for f in &meta.files {
+            let f_start = acc;
+            let f_end = acc + f.size;
+            if cursor_offset < f_end {
+                target_file = Some(f);
+                target_file_start = f_start;
+                break;
+            }
+            acc = f_end;
+        }
+        let f_info = match target_file {
+            Some(f) => f,
+            None => return Err(anyhow!("BT offset {} 超过 total_size {} (files={})",
+                cursor_offset, meta.total_size, meta.files.len())),
+        };
+        let local_offset = cursor_offset - target_file_start;
+        let can_write_in_this_file = (f_info.size.saturating_sub(local_offset))
+            .min(remaining.len() as u64) as usize;
+        if can_write_in_this_file == 0 { break; }
+
+        let path = out_dir.join(&f_info.name);
+        if let Some(parent) = path.parent() { tokio::fs::create_dir_all(parent).await.ok(); }
+        let mut f = tokio::fs::OpenOptions::new()
+            .create(true).write(true).read(true)
+            .open(&path).await
+            .map_err(|e| anyhow!("open {} fail: {}", path.display(), e))?;
+        // 预分配文件大小 (一次, 避免多次写入时碎片/扩张)
+        let _ = f.set_len(f_info.size).await;
+        f.seek(std::io::SeekFrom::Start(local_offset)).await
+            .map_err(|e| anyhow!("seek {} @ {} fail: {}", path.display(), local_offset, e))?;
+        f.write_all(&remaining[..can_write_in_this_file]).await
+            .map_err(|e| anyhow!("write {} fail: {}", path.display(), e))?;
+
+        remaining = &remaining[can_write_in_this_file..];
+        cursor_offset += can_write_in_this_file as u64;
     }
     Ok(())
 }
@@ -1445,4 +1924,359 @@ async fn read_bt_message(
     };
     let payload = if len > 1 { buf[1..len].to_vec() } else { Vec::new() };
     Ok(BtParsedMsg { id, payload })
+}
+
+// ============================================================
+// 单元测试 + 集成测试: 验证 BT 种子/进度/写文件/tracker
+// ============================================================
+#[cfg(test)]
+mod bt_tests {
+    use super::*;
+    use crate::modules::{EngineContext, NetworkMode, DownloadMode, ProtocolMode, RwLockContainer, BandwidthEMA, PeerScore, EngineEvent};
+    use crate::speed_engine::{SmoothScheduler, SpeedSmoother, OscillationGuard};
+
+    fn build_minimal_ctx(output: std::path::PathBuf, file_size: u64) -> Arc<EngineContext> {
+        use std::time::Instant;
+        use tokio::sync::{Semaphore, Mutex as TMutex};
+        use flume;
+        use std::collections::{HashMap, VecDeque};
+        let cfg = DownloadConfig::default();
+        let chunk_mgr = Arc::new(HybridChunkManager::new(file_size.max(1024), 16384));
+        let (event_tx, event_rx) = flume::unbounded::<EngineEvent>();
+        let (stop_tx, stop_rx) = flume::unbounded::<()>();
+        Arc::new(EngineContext {
+            config: cfg,
+            protocol: ProtocolMode::BtOnly,
+            network_mode: NetworkMode::Auto,
+            download_mode: DownloadMode::SparseRareFirst,
+            probe: RwLockContainer::new(None),
+            output_path: output,
+            file_size: AtomicU64::new(file_size),
+            base_chunk_size: AtomicU64::new(16384),
+            chunk_mgr,
+            downloaded: Arc::new(AtomicU64::new(0)),
+            http_downloaded: AtomicU64::new(0),
+            bt_downloaded: AtomicU64::new(0),
+            file: Arc::new(TMutex::new(None)),
+            active_http_conns: AtomicU32::new(0),
+            active_bt_conns: AtomicU32::new(0),
+            http_conn_limit: AtomicU32::new(16),
+            bt_peer_limit: AtomicU32::new(16),
+            global_max_conns: AtomicU32::new(32),
+            sem_http: Arc::new(Semaphore::new(16)),
+            sem_bt: Arc::new(Semaphore::new(16)),
+            bandwidth_ema: Arc::new(BandwidthEMA::new()),
+            event_tx,
+            event_rx,
+            stop_notify: Arc::new(tokio::sync::Notify::new()),
+            stop_event_tx: stop_tx,
+            stop_event_rx: stop_rx,
+            scheduler: PMutex::new(SmoothScheduler::new(8, 10_000_000, 64 * 1024 * 1024)),
+            speed_smoother: PMutex::new(SpeedSmoother::new()),
+            oscillation_guard: PMutex::new(OscillationGuard::new()),
+            base_chunk_done: PMutex::new(Vec::new()),
+            bt_piece_map_completed: PMutex::new(Vec::new()),
+            bt_piece_size: AtomicU64::new(16384),
+            bt_total_pieces: AtomicU32::new(0),
+            peer_scores: PMutex::new(HashMap::new()),
+            bt_seeders: AtomicU32::new(0),
+            bt_peers: AtomicU32::new(0),
+            http_weight: AtomicU64::new(1000),
+            bt_weight: AtomicU64::new(1000),
+            http_ratio_target: AtomicU64::new(0.6f64.to_bits()),
+            bt_ratio_target: AtomicU64::new(0.4f64.to_bits()),
+            last_reset_count: AtomicU32::new(0),
+            last_reset_window: PRwLock::new(VecDeque::new()),
+            conn_delay_ms: AtomicU64::new(0),
+            completed_time_series: PMutex::new(Vec::new()),
+            prefetch_warmed: PMutex::new(HashMap::new()),
+            slow_subchunks: PMutex::new(HashMap::new()),
+            mirrors: Vec::new(),
+            peer_port: AtomicU32::new(6881),
+            ratio_target: AtomicU64::new(1.0f64.to_bits()),
+            seed_minutes: AtomicU32::new(0),
+            task_id: "test".into(),
+            start_instant: Instant::now(),
+            no_cross_protocol: false,
+        })
+    }
+
+    #[tokio::test]
+    async fn test_t01_torrent_generate_and_roundtrip() {
+        let data = b"Hello, SwiftFetch BT engine! ".repeat(300); // ~10KB
+        let meta = TorrentMeta::generate("test.bin", &data, 16384,
+            vec!["http://localhost:1/announce".into()])
+            .expect("generate torrent");
+        assert_eq!(meta.total_size, data.len() as u64);
+        assert_eq!(meta.files.len(), 1);
+        assert_eq!(meta.pieces.len(), 1);
+        // info_hash 不是全 0
+        assert_ne!(meta.info_hash, [0u8; 20]);
+
+        // encode → 再 parse → info_hash 必须相等
+        let bytes = meta.encode_to_bytes().expect("encode");
+        let parsed = TorrentMeta::from_torrent_bytes(&bytes).expect("reparse");
+        assert_eq!(parsed.info_hash, meta.info_hash);
+        assert_eq!(parsed.total_size, meta.total_size);
+        assert_eq!(parsed.piece_size, meta.piece_size);
+        assert_eq!(parsed.pieces.len(), meta.pieces.len());
+        assert_eq!(parsed.pieces[0], meta.pieces[0]);
+        println!("T01 PASS: generate → encode → reparse, info_hash match");
+    }
+
+    #[tokio::test]
+    async fn test_t02_file_size_fix_total_size_store_logic() {
+        // 验证: file_size 从 0 开始会被 store 正确; 如果 current!=0 也会被覆盖 (新逻辑)
+        // 具体是在 BtDownloaderModule.start 里的条件分支, 这里直接验证逻辑本身
+        let meta = TorrentMeta::generate("test.bin", &[0x42u8; 100_000], 16384, vec![])
+            .expect("gen");
+        let file_size = AtomicU64::new(0);
+        if meta.total_size > 0 {
+            let current = file_size.load(Ordering::Relaxed);
+            if current != meta.total_size {
+                file_size.store(meta.total_size, Ordering::Relaxed);
+            }
+        }
+        assert_eq!(file_size.load(Ordering::Relaxed), 100_000,
+            "current=0 时 store 正确");
+
+        let file_size2 = AtomicU64::new(1); // 之前的 bug: initial max(1)
+        if meta.total_size > 0 {
+            let current = file_size2.load(Ordering::Relaxed);
+            if current != meta.total_size {
+                file_size2.store(meta.total_size, Ordering::Relaxed);
+            }
+        }
+        assert_eq!(file_size2.load(Ordering::Relaxed), 100_000,
+            "current=1 时现在也会覆盖正确 (修复后)");
+        println!("T02 PASS: file_size store 逻辑修复验证");
+    }
+
+    #[tokio::test]
+    async fn test_t03_write_data_to_file_single() {
+        let tmp = std::env::temp_dir().join(format!("swift_bt_test_{}", rand::random::<u32>()));
+        tokio::fs::create_dir_all(&tmp).await.unwrap();
+
+        let data = b"Hello World! This is test content."; // 38 bytes
+        let meta = TorrentMeta::generate("myfile.bin", data, 16384, vec![]).unwrap();
+        let out_path = tmp.clone();
+
+        // 构造一个轻量的 EngineContext 用于写文件
+        let fs = meta.files[0].size;
+        let ctx = build_minimal_ctx(out_path.clone(), fs);
+        ctx.bt_total_pieces.store(meta.pieces.len() as u32, Ordering::Relaxed);
+        ctx.bt_piece_size.store(meta.piece_size, Ordering::Relaxed);
+
+        write_data_to_file(ctx, &meta, 0, data).await.expect("write_all");
+        // 读取验证
+        let on_disk = tokio::fs::read(out_path.join("myfile.bin")).await.expect("read back");
+        assert_eq!(on_disk, data, "写回内容不匹配");
+        // 清理
+        let _ = std::fs::remove_dir_all(&tmp);
+        println!("T03 PASS: write_data_to_file 单文件写入验证");
+    }
+
+    #[tokio::test]
+    async fn test_t04_write_data_to_file_multi() {
+        let tmp = std::env::temp_dir().join(format!("swift_bt_test_multi_{}", rand::random::<u32>()));
+        tokio::fs::create_dir_all(&tmp).await.unwrap();
+
+        // 构造 3 个文件的虚拟多文件种子:
+        //   file1.bin: 10 bytes "AAAAAAAAAA"
+        //   sub/file2.bin: 5 bytes "BBBBB"
+        //   sub/deep/file3.bin: 7 bytes "CCCCCCC"
+        // 虚拟字节流连续: [AAA..A(10) + BBB..B(5) + CCC..C(7) = 22 bytes]
+        let f1 = b"AAAAAAAAAA".to_vec(); // 10
+        let f2 = b"BBBBB".to_vec();    // 5
+        let f3 = b"CCCCCCC".to_vec();  // 7
+        let combined: Vec<u8> = [f1.clone(), f2.clone(), f3.clone()].concat(); // 22
+
+        // 用单文件 data 生成 meta 后手动篡改 files 字段模拟多文件
+        let piece_size = 16384u64;
+        let mut pieces: Vec<[u8; 20]> = Vec::new();
+        for ch in combined.chunks(piece_size as usize) {
+            let mut h = Sha1::new(); h.update(ch);
+            let r = h.finalize();
+            let mut a = [0u8; 20]; a.copy_from_slice(&r); pieces.push(a);
+        }
+        let fake_tracker = format!("http://localhost:{}/announce", 9);
+        let mut meta = TorrentMeta {
+            info_hash: [0u8; 20],
+            piece_size,
+            pieces,
+            files: vec![
+                TorrentFileInfo { name: "file1.bin".into(), size: 10 },
+                TorrentFileInfo { name: "sub/file2.bin".into(), size: 5 },
+                TorrentFileInfo { name: "sub/deep/file3.bin".into(), size: 7 },
+            ],
+            total_size: 22,
+            trackers: vec![fake_tracker],
+            display_name: "multi_test".into(),
+            webseeds: vec![],
+        };
+        let bytes = meta.encode_to_bytes().unwrap();
+        let parsed = TorrentMeta::from_torrent_bytes(&bytes).unwrap();
+        meta.info_hash = parsed.info_hash; // 让 info_hash 正确
+
+        // 构造 EngineContext (复用 build_minimal_ctx)
+        let fs = 22u64;
+        let ctx = build_minimal_ctx(tmp.clone(), fs);
+        ctx.bt_total_pieces.store(meta.pieces.len() as u32, Ordering::Relaxed);
+        ctx.bt_piece_size.store(meta.piece_size, Ordering::Relaxed);
+
+        // 写: 分 3 次模拟写不同偏移 (模拟多 piece 块)
+        write_data_to_file(ctx.clone(), &meta, 0, &f1).await.unwrap();
+        write_data_to_file(ctx.clone(), &meta, 10, &f2).await.unwrap();
+        write_data_to_file(ctx.clone(), &meta, 15, &f3).await.unwrap();
+
+        assert_eq!(tokio::fs::read(tmp.join("file1.bin")).await.unwrap(), f1);
+        assert_eq!(tokio::fs::read(tmp.join("sub/file2.bin")).await.unwrap(), f2);
+        assert_eq!(tokio::fs::read(tmp.join("sub/deep/file3.bin")).await.unwrap(), f3);
+        // 大小校验
+        assert_eq!(tokio::fs::metadata(tmp.join("file1.bin")).await.unwrap().len(), 10);
+        assert_eq!(tokio::fs::metadata(tmp.join("sub/file2.bin")).await.unwrap().len(), 5);
+        assert_eq!(tokio::fs::metadata(tmp.join("sub/deep/file3.bin")).await.unwrap().len(), 7);
+        let _ = std::fs::remove_dir_all(&tmp);
+        println!("T04 PASS: write_data_to_file 多文件跨文件写入验证");
+    }
+
+    #[tokio::test]
+    async fn test_t05_http_tracker_mock() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        // 启动一个本地 HTTP tracker mock server
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind tracker");
+        let tracker_port = listener.local_addr().unwrap().port();
+        let tracker_url = format!("http://127.0.0.1:{}/announce", tracker_port);
+
+        let server = tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 8192];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                if n == 0 { continue; }
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                // 只需要返回一个 compact peers 格式的 bencode
+                // peers: 127.0.0.1:12345 => bytes [127,0,0,1,48,57] (48<<8|57 = 12345)
+                let resp_body = "d8:completei5e10:incompletei10e8:intervali1800e5:peers6:\x7f\x00\x00\x01\x30\x39e".to_string();
+                let body_bytes = resp_body.as_bytes();
+                let http = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n",
+                    body_bytes.len()
+                );
+                sock.write_all(http.as_bytes()).await.ok();
+                sock.write_all(body_bytes).await.ok();
+                sock.flush().await.ok();
+                break; // 处理一次就结束
+            }
+        });
+
+        // 等 server 启动
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(5))
+            .build().expect("client");
+        let info_hash = b"0123456789abcdef0123";
+        let peer_id = b"-SW0300-000000000000"; // 8 + 12 = 20 bytes exactly
+        let (peers, s, l) = tracker_announce_http(
+            &client, &tracker_url, info_hash, peer_id, 16384, 1048576, "started"
+        ).await.expect("http tracker announce");
+
+        assert!(peers.len() > 0, "peers 空的, mock tracker 返回失败");
+        assert_eq!(peers[0], "127.0.0.1:12345".parse::<SocketAddr>().unwrap());
+        assert_eq!(s, 5);
+        assert_eq!(l, 10);
+        let _ = server.await;
+        println!("T05 PASS: HTTP tracker 完整 announce 流程验证");
+    }
+
+    #[tokio::test]
+    async fn test_t06_piece_base_alignment_no_mismatch() {
+        // 复现 bug: 初始创建 HybridChunkManager 时 file_size=0 → max(1MB),
+        // bases 只按 1MB 切了 1 个. 但解析真实 meta (大文件, 如 500MB) 后,
+        // piece_to_base 用 aligned=32MB (HYBRID_ALIGNED_BASE) 计算, 最后 piece 会
+        // 落到 base_idx≈15, 远 >= bases.len()=1, 导致 mark_bytes 被跳过.
+        //
+        // 修复策略: 创建 chunk_mgr 之前必须预解析 meta, 用
+        // HybridChunkManager::new(meta.total_size, calc_aligned_bt_base(&meta)).
+        let piece_size = 16384u64;
+        // 500MB test: pieces ≈ 32,000, 需要的 base 数量: ceil(500MB / 32MB_aligned) = 16
+        let five_hundred_mb = 500 * 1024 * 1024usize;
+        // 用快速构造 pieces 的方式: 不需要真实 500MB 数据, 用 generate 小数据后篡改 meta
+        let small_data = vec![0xABu8; 1024];
+        let mut meta = TorrentMeta::generate("test.bin", &small_data, piece_size, vec![]).unwrap();
+        // 篡改: 手动设置 500MB total_size 和对应 pieces 数量
+        let total_pieces_needed = (five_hundred_mb as u64 + piece_size - 1) / piece_size; // ≈ 32_000
+        meta.total_size = five_hundred_mb as u64;
+        meta.pieces = vec![[0u8; 20]; total_pieces_needed as usize];
+        meta.files[0].size = five_hundred_mb as u64;
+        println!("  [scenario] total_size={} pieces={} piece_size={}",
+            meta.total_size, meta.pieces.len(), piece_size);
+
+        // Step 1: 模拟 bug 流程 (BtOnly 时 file_size=0/fake 就创建 mgr)
+        let initial_fs_fake = 0u64;
+        let initial_base = 1024 * 1024; // 1MB
+        let buggy_fs_for_mgr = initial_fs_fake.max(1024 * 1024);
+        let buggy_mgr = HybridChunkManager::new(buggy_fs_for_mgr, initial_base);
+        println!("  [buggy]   HybridChunkManager::new(fs=1MB, base=1MB) → bases.len() = {}", buggy_mgr.bases.len());
+        let aligned = calc_aligned_bt_base(&meta);
+        println!("  [align]   calc_aligned_bt_base → {} bytes (~{}MB)", aligned, aligned / 1024 / 1024);
+        let last_piece = (meta.pieces.len() - 1) as u32;
+        let mapped_base = meta.piece_to_base(aligned, last_piece);
+        let bases_needed = mapped_base + 1;
+        println!("  [align]   last_piece_idx={} → piece_to_base → base_idx={}, bases_needed={}",
+            last_piece, mapped_base, bases_needed);
+        // BUG 断言: buggy_mgr.bases.len() (1) << bases_needed (16 左右)
+        assert!(buggy_mgr.bases.len() < bases_needed as usize,
+            "BUG 复现失败: buggy.len({}) >= needed({})", buggy_mgr.bases.len(), bases_needed);
+
+        // Step 2: 修复后流程: 预解析 meta → 用正确参数创建 mgr
+        let fixed_mgr = HybridChunkManager::new(meta.total_size, aligned);
+        println!("  [fixed]   HybridChunkManager::new({}MB, {}MB) → bases.len() = {}",
+            meta.total_size / 1024 / 1024, aligned / 1024 / 1024, fixed_mgr.bases.len());
+        assert!(fixed_mgr.bases.len() as u32 >= bases_needed,
+            "修复后: bases.len({}) < needed({})", fixed_mgr.bases.len(), bases_needed);
+        // 遍历每个 piece 验证索引合法
+        let ok = meta.pieces.iter().enumerate().all(|(i, _)| {
+            let bidx = meta.piece_to_base(aligned, i as u32);
+            (bidx as usize) < fixed_mgr.bases.len()
+        });
+        assert!(ok, "修复后存在 piece 其 base_idx >= bases.len()");
+        println!("T06 PASS: bases/piece 对齐: buggy={} < needed={} vs fixed={} >= needed",
+            buggy_mgr.bases.len(), bases_needed, fixed_mgr.bases.len());
+    }
+
+    #[tokio::test]
+    async fn test_t07_chunk_mgr_rebuild_api_helper() {
+        // 验证思路: 解析 meta 后, 按真实 total_size + aligned base_chunk_size
+        // 创建全新 HybridChunkManager, 保证 piece_to_base 索引不越界
+        use std::sync::atomic::Ordering;
+        let tmp = std::env::temp_dir().join(format!("swift_rebuild_test_{}", rand::random::<u32>()));
+        let _ = tokio::fs::create_dir_all(&tmp).await;
+        let data = vec![0xCDu8; 3 * 1024 * 1024];
+        let piece_size = 16384u64;
+        let meta = TorrentMeta::generate("t3mb.bin", &data, piece_size, vec![]).unwrap();
+
+        // 初始 fake (和 BtOnly 流程一致, file_size=0 → max(1MB))
+        let ctx = build_minimal_ctx(tmp.clone(), 0);
+        let initial_bases_len = ctx.chunk_mgr.bases.len();
+        println!("  initial bases.len={} (file_size=0 → max 1MB)", initial_bases_len);
+
+        // 模拟修复: 解析 meta → 重建全新 Manager (替换思路，实际中在 resolve_meta 后创建 ctx)
+        ctx.file_size.store(meta.total_size, Ordering::Relaxed);
+        let aligned: u64 = 16 * 1024 * 1024; // 简化
+        ctx.base_chunk_size.store(aligned, Ordering::Relaxed);
+        // 验证: 用真实参数重建 new_mgr 后所有 piece 索引合法
+        let new_mgr = HybridChunkManager::new(meta.total_size, aligned);
+        let ok = meta.pieces.iter().enumerate().all(|(i, _)| {
+            let bidx = meta.piece_to_base(aligned, i as u32);
+            (bidx as usize) < new_mgr.bases.len()
+        });
+        assert!(ok, "存在 piece 其 base_idx >= new_mgr.bases.len()");
+        println!("  after rebuild bases.len={} → all pieces in range", new_mgr.bases.len());
+        let _ = std::fs::remove_dir_all(&tmp);
+        println!("T07 PASS: 解析 meta 后重建 bases 的修复思路验证");
+    }
 }

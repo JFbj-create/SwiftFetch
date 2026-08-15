@@ -323,6 +323,40 @@ impl HybridChunkManager {
         self.bases.iter().filter(|b| b.downloaded() >= b.size).count()
     }
 
+    /// 关键修复: BT 模式下, 解析 .torrent 得到真实 total_size 和 piece_aligned_base 后,
+    /// 必须重新切分 base chunks, 否则 piece_to_base 计算的 idx 会越界,
+    /// completed_count() 永远追不上 bases.len(), 导致进度卡死.
+    /// 必须在启动任何 worker 前调用 (此时 Arc<Self> 的 refcount=1, 才能通过 Arc::make_mut 拿到 &mut).
+    pub fn rebuild_for_bt(&mut self, real_file_size: u64, aligned_base: u64) {
+        // 重新按 new() 逻辑生成 bases 向量, 并更新元数据字段
+        let mut bases = Vec::new();
+        let mut id = 0u32;
+        let mut offset = 0u64;
+        while offset < real_file_size {
+            let end = std::cmp::min(offset + aligned_base - 1, real_file_size - 1);
+            let size = end - offset + 1;
+            bases.push(Arc::new(BaseChunk {
+                id,
+                start: offset,
+                end,
+                size,
+                completed: false,
+                downloaded_atomic: Arc::new(AtomicU64::new(0)),
+                sub_chunks: PMutex::new(VecDeque::new()),
+                assigned_workers: AtomicU64::new(0),
+                start_time: PRwLock::new(None),
+                bytes_before: AtomicU64::new(0),
+                first_downloaded_at: PRwLock::new(None),
+            }));
+            id += 1;
+            offset += aligned_base;
+        }
+        self.bases = bases;
+        self.file_size = real_file_size;
+        self.base_chunk_size = aligned_base;
+        self.original_base_size = aligned_base;
+    }
+
     pub fn update_slow_threshold(&self, avg_bps: u64) {
         *self.slow_chunk_threshold.write() = (avg_bps as f64 * SLOW_CHUNK_FACTOR) as u64;
     }

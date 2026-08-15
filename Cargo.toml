@@ -13,7 +13,7 @@ default = ["http", "bittorrent"]
 # ===== 各下载协议 feature flag (默认只开 http + bittorrent, 其余按需开启) =====
 http = ["dep:reqwest", "reqwest/rustls-tls", "reqwest/stream", "reqwest/json"]
 http2 = ["http", "reqwest/http2"]
-http3 = ["http2", "reqwest/http3"]    # 实验性: reqwest + quinn/h3-quinn, 需要 rustls
+http3 = ["http2", "reqwest?/http3"]    # 实验性: reqwest + quinn/h3-quinn, 需要 rustls + RUSTFLAGS='--cfg reqwest_unstable'
 bittorrent = []
 ftp = ["dep:suppaftp", "suppaftp/tokio", "suppaftp/tokio-rustls-aws-lc-rs", "suppaftp/rustls-aws-lc-rs"]  # FTP + FTPS (rustls async/sync API 都需要)
 ftps = ["ftp"]                                                       # ftps = ftp (同一 feature, suppaftp 自动启用tls)
@@ -33,7 +33,11 @@ tokio-util = { version = "0.7", features = ["io", "codec"] }
 futures = "0.3"
 futures-util = "0.3"
 # ===== http family (feature-gated) =====
-reqwest = { version = "0.12", optional = true, default-features = false, features = ["json", "stream", "rustls-tls", "cookies", "gzip", "brotli", "deflate", "socks", "http2", "http3"] }
+# 注意: reqwest/http3 属于 reqwest 不稳定 API, 启用必须同时设置
+#       RUSTFLAGS='--cfg reqwest_unstable' (cargo build 时作为环境变量传入)
+#       所以在默认 reqwest 依赖列表里只放 json/stream/rustls-tls/cookies/压缩/socks/http2,
+#       http3 仅在显式开启 http3 feature 时附加
+reqwest = { version = "0.12", optional = true, default-features = false, features = ["json", "stream", "rustls-tls", "cookies", "gzip", "brotli", "deflate", "socks", "http2"] }
 cookie = "0.18"
 cookie_store = "0.21"
 # ===== optional protocol crates (feature-gated) =====
